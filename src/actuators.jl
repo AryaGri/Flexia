@@ -58,7 +58,7 @@ function propagate_targets!(sys::MBSystem2D, act::PositionMotor2D)
     return nothing
 end
 
-function update_jacobian!(sys::MBSystem2D, jac::Matrix{Float64}, act::PositionMotor2D)
+function update_jacobian!(sys::MBSystem2D, jac::AbstractMatrix{Float64}, act::PositionMotor2D)
     lms = get_lms(sys, act)
     # rhs row is  f = θ2 - θ1 - target(t),  so ∂f/∂t = -d(target)/dt
     jac[lms[1], end] = -act.current_velocity
@@ -117,7 +117,7 @@ function propagate_targets!(sys::MBSystem2D, act::PositionLinearActuator2D)
     return nothing
 end
 
-function update_jacobian!(sys::MBSystem2D, jac::Matrix{Float64}, act::PositionLinearActuator2D)
+function update_jacobian!(sys::MBSystem2D, jac::AbstractMatrix{Float64}, act::PositionLinearActuator2D)
     lms = get_lms(sys, act)
     # rhs row is  f = s - target(t),  so ∂f/∂t = -d(target)/dt
     jac[lms[1], end] = -act.current_velocity

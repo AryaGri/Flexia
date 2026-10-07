@@ -14,7 +14,8 @@ mutable struct MBSystem2D
     kinematic_constrains!::Function
     targets::Vector{Float64}
     mass::Matrix{Float64}
-    
+    sparse_jacobian::Union{Nothing, SparseJacobianCache}
+
 
     function MBSystem2D()
         bodies = Vector{AbstractBody2D}([])
@@ -44,8 +45,9 @@ mutable struct MBSystem2D
             default_prestep, 
             default_measure,
             default_kinematic_constrains, 
-            targets, 
-            mass)
+            targets,
+            mass,
+            nothing)
     end
 end
 
@@ -81,7 +83,8 @@ end
 number_of_dofs(sys) = last_lm_dof(sys) + 1
 number_of_generalized_coordinates(sys) = length(sys.bodies) * 3
 
-function assemble!(sys)
+
+function assemble!(sys; sparse_jacobian::Bool=true)
     state_length = number_of_dofs(sys) 
     sys.mass = zeros(state_length, state_length)
 
@@ -125,7 +128,15 @@ function assemble!(sys)
         return ret
     end
 
-    sys.jacobian = (state) -> ForwardDiff.jacobian(sys.rhs, state)
+    if sparse_jacobian
+        cache = SparseJacobianCache(sys, zeros(state_length))
+        sys.jacobian = (state) -> sparse_jacobian!(similar(cache.pattern), sys.rhs, state, cache)
+        cache.jacobian_fn = sys.jacobian
+        sys.sparse_jacobian = cache
+    else
+        sys.jacobian = (state) -> ForwardDiff.jacobian(sys.rhs, state)
+        sys.sparse_jacobian = nothing
+    end
     sys.kinematic_constrains! = (residual, generalized_coordinates) -> begin
         for connector in connectors(sys)
             compute_kinematic_residual!(residual, generalized_coordinates, sys, connector)
@@ -172,7 +183,7 @@ end
 
 
 
-function update_act_jacobian!(sys::MBSystem2D, jac::Matrix{Float64})
+function update_act_jacobian!(sys::MBSystem2D, jac::AbstractMatrix{Float64})
     for connector in connectors(sys)
         update_jacobian!(sys, jac, connector)
     end

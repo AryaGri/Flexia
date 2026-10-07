@@ -4,6 +4,8 @@ using StaticArrays
 using Makie
 using LinearAlgebra
 using ForwardDiff
+using SparseArrays
+using SparseConnectivityTracer: TracerSparsityDetector, jacobian_sparsity
 # export MBSystem
 # export Body2D
 
@@ -66,6 +68,7 @@ export test_func
 
 test_func() = 1
 
+include("sparse_jacobian.jl")
 include("system.jl")
 include("solvers.jl")
 # include("markers.jl")
