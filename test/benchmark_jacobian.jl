@@ -1,61 +1,45 @@
-# Dense ForwardDiff Jacobian vs sparse Jacobian, and full `simulate` time.
-#
-#   julia --project=. test/benchmark_jacobian.jl
+# Сравнение скорости: старый плотный якобиан и новый разреженный
+# запуск: julia --project=. test/benchmark_jacobian.jl
 
 using Flexia
 using ForwardDiff
-using LinearAlgebra
-using Printf
 
 include("mechanisms.jl")
 
-# minimal time of `f()` over `repeats` runs after a warm-up call
-function best_time(f; repeats=5)
+# минимальное время из нескольких запусков (первый запуск не считаем, там компиляция)
+function min_time(f, repeats)
     f()
-    return minimum(@elapsed(f()) for _ in 1:repeats)
-end
-
-function jacobian_times(sys, state)
-    dense = best_time(() -> ForwardDiff.jacobian(sys.rhs, state); repeats=50)
-    sparse = best_time(() -> sys.jacobian(state); repeats=50)
-    return dense, sparse
-end
-
-function simulate_times(build, time_span)
-    sys_dense, initial = build(; sparse_jacobian=false)
-    sys_sparse, _ = build()
-    dense = best_time(() -> simulate(sys_dense, initial, time_span); repeats=3)
-    times = Dict{Symbol,Float64}()
-    for linear_solver in (:auto, :dense, :sparse)
-        times[linear_solver] = best_time(() -> simulate(sys_sparse, initial, time_span; linear_solver); repeats=3)
+    best = Inf
+    for i in 1:repeats
+        best = min(best, @elapsed f())
     end
-    return dense, times
+    return best
 end
 
-cases = [
-    ("crankshaft", (; kw...) -> build_crankshaft(; kw...)),
-    ("linear actuator", (; kw...) -> build_linear_actuator(; kw...)),
-    [("chain $n", (; kw...) -> build_chain(n; kw...)) for n in (2, 5, 10, 20, 50, 100)]...,
+builders = [
+    ("crankshaft", build_crankshaft),
+    ("linear actuator", build_linear_actuator),
+    ("chain 2", (; kw...) -> build_chain(2; kw...)),
+    ("chain 5", (; kw...) -> build_chain(5; kw...)),
+    ("chain 10", (; kw...) -> build_chain(10; kw...)),
+    ("chain 20", (; kw...) -> build_chain(20; kw...)),
+    ("chain 50", (; kw...) -> build_chain(50; kw...)),
 ]
 
-println("Jacobian of rhs, one evaluation")
-@printf("%-16s %5s %6s %7s %12s %12s %8s\n", "mechanism", "n", "nnz", "colors", "dense, μs", "sparse, μs", "speedup")
-for (name, build) in cases
-    sys, initial = build()
-    n = number_of_dofs(sys)
-    cache = sys.sparse_jacobian
-    dense, sparse = jacobian_times(sys, initial)
-    @printf("%-16s %5d %6d %7d %12.1f %12.1f %7.1fx\n", name, n, length(cache.pattern.nzval),
-        cache.ncolors, 1e6 * dense, 1e6 * sparse, dense / sparse)
-end
+time_span = 0:0.001:0.2
 
-println()
-println("simulate, 200 steps")
-@printf("%-16s %5s %12s %12s %12s %12s %8s\n", "mechanism", "n", "old, ms", "auto, ms", "dense LU, ms", "sparse LU, ms", "speedup")
-for (name, build) in cases
-    time_span = 0:0.001:0.2
-    sys, _ = build()
-    dense, times = simulate_times(build, time_span)
-    @printf("%-16s %5d %12.2f %12.2f %12.2f %12.2f %7.1fx\n", name, number_of_dofs(sys), 1e3 * dense,
-        1e3 * times[:auto], 1e3 * times[:dense], 1e3 * times[:sparse], dense / times[:auto])
+println("name | n | colors | jac old, mks | jac new, mks | simulate old, ms | simulate new, ms")
+for (name, build) in builders
+    sys, initial = build()
+    sys_old, _ = build(sparse_jacobian=false)
+    n = number_of_dofs(sys)
+
+    t_jac_old = min_time(() -> sys_old.jacobian(initial), 30)
+    t_jac_new = min_time(() -> sys.jacobian(initial), 30)
+    t_sim_old = min_time(() -> simulate(sys_old, initial, time_span), 3)
+    t_sim_new = min_time(() -> simulate(sys, initial, time_span), 3)
+
+    println(name, " | ", n, " | ", maximum(sys.jac_colors), " | ",
+        round(t_jac_old * 1e6, digits=1), " | ", round(t_jac_new * 1e6, digits=1), " | ",
+        round(t_sim_old * 1e3, digits=2), " | ", round(t_sim_new * 1e3, digits=2))
 end

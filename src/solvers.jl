@@ -14,98 +14,13 @@ function cros!(sol::Matrix{T}, u0::Vector{T}, mass::Matrix{T}, func::Function, j
 end
 
 
-function cros!(sol::Matrix{T}, u0::Vector{T}, mass::Matrix{T}, sys::MBSystem2D, time_step::T;
-    linear_solver::Symbol=:auto) where T<:Real
-    cache = sys.sparse_jacobian
-    if cache === nothing || sys.jacobian !== cache.jacobian_fn
-        return cros_dense!(sol, u0, mass, sys, time_step)
-    end
-    return cros_sparse!(sol, u0, mass, sys, cache, time_step, linear_solver)
-end
-
-
-const DENSE_LU_MAX_SIZE = 80
-
-function stored_positions(A::SparseMatrixCSC, B::SparseMatrixCSC)
-    positions = Vector{Int64}(undef, nnz(B))
-    rows_a = rowvals(A)
-    rows_b = rowvals(B)
-    for j in axes(B, 2)
-        range_a = nzrange(A, j)
-        for idx in nzrange(B, j)
-            positions[idx] = range_a[searchsortedfirst(view(rows_a, range_a), rows_b[idx])]
-        end
-    end
-    return positions
-end
-
-function cros_sparse!(sol::Matrix{T}, u0::Vector{T}, mass::Matrix{T}, sys::MBSystem2D,
-    cache::SparseJacobianCache, time_step::T, linear_solver::Symbol) where T<:Real
+function cros!(sol::Matrix{T}, u0::Vector{T}, mass::Matrix{T}, sys::MBSystem2D, time_step::T) where T<:Real
     @assert size(sol, 1) == size(u0, 1)
     @assert size(sol, 1) == size(sys.rhs(u0), 1)
     n = length(u0)
-    γ = (1 + im) / 2 * time_step
-
-    jac = similar(cache.pattern)
-    act_jac = copy(cache.pattern)
-    act_vals = nonzeros(act_jac)
-    jac_vals = nonzeros(jac)
-
-    mass_sparse = sparse(mass)
-    mass_rows, mass_cols, _ = findnz(mass_sparse)
-    jac_rows, jac_cols, _ = findnz(cache.pattern)
-    # A = mass - γ * jac on the union of both patterns
-    A = sparse([mass_rows; jac_rows], [mass_cols; jac_cols],
-        zeros(ComplexF64, length(mass_rows) + length(jac_rows)), n, n)
-    A_vals = nonzeros(A)
-    mass_positions = stored_positions(A, mass_sparse)
-    jac_positions = stored_positions(A, jac)
-
-    use_dense = linear_solver === :dense || (linear_solver === :auto && n <= DENSE_LU_MAX_SIZE)
-    A_dense = use_dense ? Matrix{ComplexF64}(undef, n, n) : Matrix{ComplexF64}(undef, 0, 0)
-    sparse_factorization = nothing
-    ζ = Vector{ComplexF64}(undef, n)
-
-    sol[:, 1] = u0
-    for i in 2:size(sol, 2)
-        u_cur = sol[:, i-1]
-        sys.prestep(u_cur)
-        update_targets!(sys)
-        f_i = sys.rhs(u_cur)
-
-        sparse_jacobian!(jac, sys.rhs, u_cur, cache)
-        fill!(act_vals, 0.0)
-        update_act_jacobian!(sys, act_jac)
-        jac_vals .+= act_vals
-
-        fill!(A_vals, zero(ComplexF64))
-        for k in eachindex(mass_positions)
-            A_vals[mass_positions[k]] += nonzeros(mass_sparse)[k]
-        end
-        for k in eachindex(jac_positions)
-            A_vals[jac_positions[k]] -= γ * jac_vals[k]
-        end
-
-        ζ .= f_i
-        if use_dense
-            copyto!(A_dense, A)
-            ldiv!(lu!(A_dense), ζ)
-        else
-            if sparse_factorization === nothing
-                sparse_factorization = lu(A)
-            else
-                lu!(sparse_factorization, A)
-            end
-            ζ = sparse_factorization \ ζ
-        end
-        sol[:, i] = u_cur + time_step * real.(ζ)
-    end
-end
-
-function cros_dense!(sol::Matrix{T}, u0::Vector{T}, mass::Matrix{T}, sys::MBSystem2D, time_step::T) where T<:Real
-    @assert size(sol, 1) == size(u0, 1)
-    @assert size(sol, 1) == size(sys.rhs(u0), 1)
-    act_jac = zeros(size(sys.rhs(u0), 1), size(sys.rhs(u0), 1))
+    # масса и добавка от актуаторов тоже разреженные, чтобы якобиан не превращался в плотный
+    mass_sp = sparse(mass)
+    act_jac = spzeros(n, n)
     sol[:, 1] = u0
     for i in 2:size(sol, 2)
         #cros_step(sys.func, sys.jac, mass, time_step, sol[:, i-1])
@@ -115,16 +30,22 @@ function cros_dense!(sol::Matrix{T}, u0::Vector{T}, mass::Matrix{T}, sys::MBSyst
         f_i = sys.rhs(u_cur)
         update_act_jacobian!(sys, act_jac)
         jac_ful = sys.jacobian(u_cur) + act_jac
-        ζ = (mass - (1 + im) / 2 * time_step * jac_ful) \ f_i
+        A = mass_sp - (1 + im) / 2 * time_step * jac_ful
+        if n <= 80
+            # для маленьких систем плотное LU быстрее разреженного (проверила в test/benchmark_jacobian.jl)
+            ζ = Matrix(A) \ f_i
+        else
+            ζ = A \ complex(f_i)
+        end
         sol[:, i] = u_cur + time_step * real.(ζ);
     end
 end
 
-function simulate(sys::MBSystem2D, initial::Vector{Float64}, time_span; linear_solver::Symbol=:auto)
+function simulate(sys::MBSystem2D, initial::Vector{Float64}, time_span)
 
     sol = Matrix{Float64}(undef, number_of_dofs(sys), length(time_span))
     mass = sys.mass
-    cros!(sol, initial, mass, sys, step(time_span); linear_solver)
+    cros!(sol, initial, mass, sys, step(time_span))
     return sol;
 end
 

@@ -1,150 +1,72 @@
-# Sparse Jacobian of the system right-hand side.
+# Разреженный якобиан правой части.
 #
-# The structure of ∂rhs/∂state is fixed by the topology of the mechanism
-# (which bodies are connected by which joints), so it is detected once in
-# `assemble!` and reused on every time step:
-#
-#   1. Sparsity pattern — `sys.rhs` is evaluated once on symbolic tracer
-#      numbers (SparseConnectivityTracer). Each tracer carries the set of
-#      state entries it depends on, so the result is the exact structural
-#      pattern for any state, not just for the one used for tracing.
-#   2. Column coloring — columns that never share a row get the same color
-#      (greedy distance-2 coloring). All columns of one color can be
-#      differentiated with a single dual-number direction.
-#   3. Compressed ForwardDiff — `sys.rhs` is evaluated with `ncolors`
-#      partials instead of `n`, and the values are scattered straight into
-#      the nonzeros of a `SparseMatrixCSC`.
-#
-# The cost of one Jacobian is therefore ⌈ncolors / 12⌉ evaluations of rhs
-# instead of ⌈n / 12⌉, and ncolors does not grow with the number of bodies.
+# Идея: какие элементы якобиана ненулевые, зависит только от того, какие тела
+# соединены какими шарнирами. Поэтому шаблон ищем один раз в assemble!,
+# а потом на каждом шаге считаем только ненулевые элементы.
 
-struct JacobianTag end
-
-# ForwardDiff's default maximal chunk size: never use more partials per pass
-# than the dense `ForwardDiff.jacobian` did.
-const MAX_JACOBIAN_CHUNK = 12
-
-mutable struct SparseJacobianCache{N}
-    pattern::SparseMatrixCSC{Float64,Int64}
-    colors::Vector{Int64}
-    ncolors::Int64
-    xdual::Vector{ForwardDiff.Dual{JacobianTag,Float64,N}}
-    # `sys.jacobian` created by `assemble!`. If a user replaces
-    # `sys.jacobian`, the solver falls back to the dense path with it.
-    jacobian_fn::Function
-    # false when the pattern could not be traced and a dense one is used
-    traced::Bool
-end
-
-number_of_colors(cache::SparseJacobianCache) = cache.ncolors
-jacobian_pattern(cache::SparseJacobianCache) = cache.pattern
-
-# Records which entries `update_jacobian!` of connectors writes to, so that
-# those entries can be added to the sparsity pattern.
-struct EntryRecorder <: AbstractMatrix{Float64}
-    m::Int64
-    n::Int64
-    rows::Vector{Int64}
-    cols::Vector{Int64}
-end
-EntryRecorder(m, n) = EntryRecorder(m, n, Int64[], Int64[])
-Base.size(r::EntryRecorder) = (r.m, r.n)
-Base.getindex(::EntryRecorder, i::Int, j::Int) = 0.0
-function Base.setindex!(r::EntryRecorder, v, i::Int, j::Int)
-    push!(r.rows, i)
-    push!(r.cols, j)
-    return v
-end
-
-function detect_rhs_sparsity(rhs::Function, state::Vector{Float64})
+# Шаблон разреженности. В rhs вместо чисел подставляются специальные "числа"
+# из SparseConnectivityTracer, которые запоминают, от каких переменных они зависят.
+function find_jacobian_pattern(sys)
+    n = number_of_dofs(sys)
+    pattern = spzeros(Bool, n, n)
     try
-        return jacobian_sparsity(rhs, state, TracerSparsityDetector()), true
-    catch err
-        # Tracers have no numeric value, so rhs code with value-dependent
-        # branches (`if t < 1 ...`) cannot be traced. A dense pattern keeps
-        # the result correct and the cost equal to the dense ForwardDiff.
-        @warn "Could not detect the sparsity pattern of the rhs, the Jacobian will be computed as dense" exception = (err, catch_backtrace())
-        n = length(state)
-        return sparse(trues(n, n)), false
+        pattern = jacobian_sparsity(sys.rhs, zeros(n), TracerSparsityDetector())
+    catch
+        # так бывает, если в силе есть if по времени или по состоянию
+        @warn "Не получилось найти шаблон разреженности, якобиан будет плотным"
+        pattern = sparse(ones(Bool, n, n))
     end
+
+    # актуаторы в update_jacobian! пишут производную по времени в последний столбец,
+    # в rhs этой зависимости нет, поэтому добавляем эти элементы руками
+    for connector in connectors(sys)
+        if connector isa AbstractPositionActuator2D
+            lm = get_lms(sys, connector)[1]
+            pattern[lm, n] = true
+        end
+    end
+    return Float64.(pattern)
 end
 
-# Greedy distance-2 column coloring, largest columns first: two columns get
-# different colors if they have a nonzero in the same row.
-function color_columns(pattern::SparseMatrixCSC)
+# Раскраска столбцов: два столбца можно покрасить в один цвет,
+# если у них нет ненулевых элементов в одной и той же строке
+function color_columns(pattern)
     n = size(pattern, 2)
     rows = rowvals(pattern)
-    by_row = sparse(pattern')
-    cols_in_row = rowvals(by_row)
-
     colors = zeros(Int64, n)
-    forbidden = zeros(Int64, n + 1)
-    order = sortperm([length(nzrange(pattern, j)) for j in 1:n]; rev=true)
-    for j in order
-        for idx in nzrange(pattern, j), idx2 in nzrange(by_row, rows[idx])
-            c = colors[cols_in_row[idx2]]
-            c > 0 && (forbidden[c] = j)
-        end
+    # для каждой строки храним цвета, которые в ней уже заняты
+    used_colors = [Set{Int64}() for i in 1:size(pattern, 1)]
+    for j in 1:n
+        col_rows = rows[nzrange(pattern, j)]
         c = 1
-        while forbidden[c] == j
+        while any(c in used_colors[i] for i in col_rows)
             c += 1
         end
         colors[j] = c
+        for i in col_rows
+            push!(used_colors[i], c)
+        end
     end
     return colors
 end
 
-function SparseJacobianCache(sys, state::Vector{Float64})
-    n = length(state)
-    traced_pattern, traced = detect_rhs_sparsity(sys.rhs, state)
+function calc_sparse_jacobian(sys, state)
+    pattern = sys.jac_pattern
+    colors = sys.jac_colors
+    ncolors = maximum(colors)
 
-    recorder = EntryRecorder(n, n)
-    update_act_jacobian!(sys, recorder)
+    # все переменные одного цвета сдвигаем на одно и то же c[цвет],
+    # тогда производных нужно ncolors штук, а не n
+    shifted_rhs = (c) -> sys.rhs([state[j] + c[colors[j]] for j in eachindex(state)])
+    B = ForwardDiff.jacobian(shifted_rhs, zeros(ncolors))
 
-    rows, cols, _ = findnz(traced_pattern)
-    append!(rows, recorder.rows)
-    append!(cols, recorder.cols)
-    pattern = sparse(rows, cols, zeros(length(rows)), n, n, (a, b) -> a)
-
-    colors = color_columns(pattern)
-    ncolors = n == 0 ? 0 : maximum(colors)
-    # balance the passes: 13 colors -> 2 passes of 7, not 12 + 1
-    npasses = max(1, cld(ncolors, MAX_JACOBIAN_CHUNK))
-    N = max(1, cld(ncolors, npasses))
-    xdual = Vector{ForwardDiff.Dual{JacobianTag,Float64,N}}(undef, n)
-    return SparseJacobianCache{N}(pattern, colors, ncolors, xdual, identity, traced)
-end
-
-@inline function seed(::Val{N}, k::Int) where {N}
-    return ForwardDiff.Partials{N,Float64}(ntuple(i -> Float64(i == k), Val(N)))
-end
-
-"""
-    sparse_jacobian!(J, rhs, state, cache)
-
-Fill the nonzeros of `J` (which must have the structure of
-`cache.pattern`) with ∂rhs/∂state at `state`.
-"""
-function sparse_jacobian!(
-    J::SparseMatrixCSC{Float64,Int64}, rhs::Function,
-    state::AbstractVector{Float64}, cache::SparseJacobianCache{N}) where {N}
-
-    colors = cache.colors
-    xdual = cache.xdual
+    # раскладываем сжатый якобиан обратно по своим местам
+    J = copy(pattern)
     rows = rowvals(J)
     vals = nonzeros(J)
-    for first_color in 1:N:cache.ncolors
-        for j in eachindex(xdual)
-            k = colors[j] - first_color + 1
-            xdual[j] = ForwardDiff.Dual{JacobianTag}(state[j], seed(Val(N), k))
-        end
-        ydual = rhs(xdual)
-        for j in axes(J, 2)
-            k = colors[j] - first_color + 1
-            1 <= k <= N || continue
-            for idx in nzrange(J, j)
-                vals[idx] = ForwardDiff.partials(ydual[rows[idx]], k)
-            end
+    for j in 1:size(J, 2)
+        for k in nzrange(J, j)
+            vals[k] = B[rows[k], colors[j]]
         end
     end
     return J
