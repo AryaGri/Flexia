@@ -14,7 +14,8 @@ mutable struct MBSystem2D
     kinematic_constrains!::Function
     targets::Vector{Float64}
     mass::Matrix{Float64}
-    sparse_jacobian::Union{Nothing, SparseJacobianCache}
+    jac_pattern::SparseMatrixCSC{Float64, Int64}  # шаблон разреженности якобиана
+    jac_colors::Vector{Int64}                     # цвет каждого столбца
 
 
     function MBSystem2D()
@@ -47,7 +48,8 @@ mutable struct MBSystem2D
             default_kinematic_constrains, 
             targets,
             mass,
-            nothing)
+            spzeros(0, 0),
+            Int64[])
     end
 end
 
@@ -129,13 +131,13 @@ function assemble!(sys; sparse_jacobian::Bool=true)
     end
 
     if sparse_jacobian
-        cache = SparseJacobianCache(sys, zeros(state_length))
-        sys.jacobian = (state) -> sparse_jacobian!(similar(cache.pattern), sys.rhs, state, cache)
-        cache.jacobian_fn = sys.jacobian
-        sys.sparse_jacobian = cache
+        # шаблон и раскраску считаем один раз, они не зависят от состояния
+        sys.jac_pattern = find_jacobian_pattern(sys)
+        sys.jac_colors = color_columns(sys.jac_pattern)
+        sys.jacobian = (state) -> calc_sparse_jacobian(sys, state)
     else
+        # старый вариант, оставила чтобы сравнивать
         sys.jacobian = (state) -> ForwardDiff.jacobian(sys.rhs, state)
-        sys.sparse_jacobian = nothing
     end
     sys.kinematic_constrains! = (residual, generalized_coordinates) -> begin
         for connector in connectors(sys)
